@@ -1,0 +1,49 @@
+GTX Browser - Terms of Use
+Last updated: 3 October 2026
+
+These are plain-language terms for GTX Browser, a small, free web browser.
+By using GTX Browser you agree to them. If you do not agree, do not use
+the program - you may remove it at any time (Setup -> Uninstall, or
+Settings -> Apps in Windows).
+
+1. What GTX Browser is
+   GTX Browser is a free desktop program for Windows that displays web
+   pages using the WebView2 engine that Windows already ships. It is not
+   sold, it is not a service, and it is not affiliated with Microsoft or
+   DuckDuckGo.
+
+2. Your data stays on your computer
+   GTX Browser does not send your browsing history, bookmarks, downloads
+   or settings to us - there is no GTX server. History, settings, logs
+   and the download list are stored in plain files in your Windows user
+   profile (the "GTX Browser" folder under AppData\Local), and you can
+   delete them at any time.
+
+3. Web content comes from other people
+   Pages, search results, downloads and certificates are provided by the
+   websites you visit. GTX Browser does not create, check or endorse that
+   content. Visiting a site shares the normal technical information every
+   browser must share (such as your IP address and browser name) with
+   that site.
+
+4. Downloads are your responsibility
+   Files you download are saved where you choose. GTX Browser records
+   the file name, source address, time and result in a local list; it
+   does not scan files for viruses. Keep your own protection up to date
+   and only download files you trust.
+
+5. Search default
+   The default search and the address suggestions use DuckDuckGo. You can
+   change this in Settings. Other sites have their own terms and privacy
+   policies, which apply to your use of them.
+
+6. No warranty
+   GTX Browser is provided "as is", without warranty of any kind. It may
+   not be uninterrupted or error-free, and to the fullest extent allowed
+   by law the authors are not liable for any damages arising from your
+   use of it.
+
+7. Changes and ending use
+   You may stop using GTX Browser and uninstall it at any time. Updated
+   versions may change these terms; the version that ships with the
+   setup program is always the one that applies to it.
