@@ -246,6 +246,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_CLOSE => {
+            log::write("WM_CLOSE");
             if !app.is_null() {
                 // Saves the session (and the config), then destroys the window.
                 unsafe { app.get() }.on_close();
@@ -283,6 +284,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(1)
         }
         WM_DESTROY => {
+            log::write("WM_DESTROY");
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
@@ -383,6 +385,14 @@ fn forward_to_running_instance(url: Option<&str>) -> bool {
 }
 
 fn main() {
+    // Release builds are `windows_subsystem = "windows"`, so a panic would
+    // vanish without a trace — record it before anything else can fail.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::write(&format!("PANIC: {info}"));
+        previous_hook(info);
+    }));
+
     let mut args = parse_args();
     let started = Instant::now();
 
@@ -457,4 +467,5 @@ fn main() {
     app.initialize(session);
 
     unsafe { run_loop(&mut app, hwnd) };
+    log::write("message loop ended; exiting");
 }

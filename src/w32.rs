@@ -11,8 +11,9 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, CreateSolidBrush, DeleteObject, FONT_CHARSET, FONT_CLIP_PRECISION,
-    FONT_OUTPUT_PRECISION, FONT_QUALITY, HFONT, HGDIOBJ, LOGFONTW,
+    CreateFontIndirectW, CreateSolidBrush, DeleteObject, GetDC, GetTextMetricsW, ReleaseDC,
+    SelectObject, TEXTMETRICW, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
+    FONT_QUALITY, HFONT, HGDIOBJ, LOGFONTW,
 };
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyW, RegQueryValueExW, HKEY_CURRENT_USER,
@@ -158,6 +159,33 @@ pub fn delete_font(font: HFONT) {
         unsafe {
             let _ = DeleteObject(HGDIOBJ(font.0));
         }
+    }
+}
+
+/// `tmHeight` of a font (its full line box) on a screen DC, or 0.
+///
+/// A single-line `EDIT` draws its text flush to the top of its client area —
+/// knowing the line height is what lets the omnibox centre that line inside
+/// the pill instead of letting it hug the top edge.
+pub fn font_line_height(font: HFONT) -> i32 {
+    if font.0.is_null() {
+        return 0;
+    }
+    unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            return 0;
+        }
+        let prev = SelectObject(hdc, HGDIOBJ(font.0));
+        let mut tm = TEXTMETRICW::default();
+        let h = if GetTextMetricsW(hdc, &mut tm).as_bool() {
+            tm.tmHeight
+        } else {
+            0
+        };
+        SelectObject(hdc, prev);
+        let _ = ReleaseDC(None, hdc);
+        h
     }
 }
 

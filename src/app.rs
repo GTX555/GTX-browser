@@ -21,18 +21,18 @@ use windows::Win32::Foundation::{COLORREF, HANDLE, HWND, LPARAM, LRESULT, POINT,
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen,
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetMonitorInfoW, InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, ReleaseDC, RoundRect,
-    ScreenToClient, SelectObject,
+    GetMonitorInfoW, InvalidateRect, LineTo, MonitorFromRect, MonitorFromWindow,
+    MoveToEx, ReleaseDC, RoundRect, ScreenToClient, SelectObject,
     SetBkMode, SetTextColor, Ellipse, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, PAINTSTRUCT,
     PS_SOLID,
-    SRCCOPY, TRANSPARENT, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    SRCCOPY, TRANSPARENT, MONITORINFO, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::Controls::Dialogs::{
     GetSaveFileNameW, OPENFILENAMEW, OFN_EXPLORER, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
     OFN_PATHMUSTEXIST,
 };
-use windows::Win32::UI::Controls::{EM_SETMARGINS, EM_SETSEL};
+use windows::Win32::UI::Controls::{EM_GETSEL, EM_SETMARGINS, EM_SETSEL};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_ESCAPE, VK_F11, VK_F12, VK_F5, VK_HOME,
@@ -43,16 +43,16 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallWindowProcW, CreateAcceleratorTableW, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyAcceleratorTable, DestroyMenu, DestroyWindow,
-    EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GetWindowLongPtrW, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, GWL_STYLE, HTCAPTION, IsZoomed, IDYES, MB_ICONWARNING, MB_YESNO,
-    MF_SEPARATOR, MF_STRING, MessageBoxW, MoveWindow,
+    EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS, GetWindowLongPtrW, GetWindowLongW, GetWindowPlacement,
+    GetWindowRect, GetWindowTextLengthW, GWL_STYLE, HTCAPTION, IsIconic, IsZoomed, IDYES,
+    MB_ICONWARNING, MB_YESNO, MF_SEPARATOR, MF_STRING, MessageBoxW, MoveWindow,
     KillTimer, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TrackPopupMenu,
     ACCEL,
     ACCEL_VIRT_FLAGS, FALT, FCONTROL, FSHIFT, FVIRTKEY, GWLP_WNDPROC, HACCEL, HMENU,
     MESSAGEBOX_RESULT, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE,
-    SW_RESTORE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_GETFONT, WM_KEYDOWN, WM_NCLBUTTONDOWN,
-    WM_PAINT, WM_SETFONT, WINDOW_STYLE, WNDPROC, WS_CHILD, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    SW_RESTORE, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOWPLACEMENT, WM_GETFONT, WM_KEYDOWN,
+    WM_LBUTTONUP, WM_NCLBUTTONDOWN, WM_PAINT, WM_SETFONT, WINDOW_STYLE, WNDPROC, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
 };
 
 use crate::{
@@ -683,6 +683,14 @@ pub struct App {
     pub icons: favicon::Cache,
     /// Tinted supplied SVG toolbar glyphs, replacing their handles on theme change.
     toolbar_icons: RefCell<toolbar_icons::Set>,
+    /// Tab the chrome mouse pressed on: (index, press x, y). Becomes a drag
+    /// once the cursor moves past the drag threshold.
+    pub tab_press: Option<(usize, i32, i32)>,
+    /// Live tab drag: (from, insert-before slot in the current visual order).
+    pub tab_drag: Option<(usize, usize)>,
+    /// `tmHeight` of `font`: the address EDIT draws its text flush to its
+    /// top, so the box is centred on this line height to centre the text.
+    pub font_line_h: i32,
 }
 
 impl App {
@@ -747,6 +755,9 @@ impl App {
                 toolbar_palette.muted,
                 toolbar_palette.text,
             )),
+            tab_press: None,
+            tab_drag: None,
+            font_line_h: 0,
         }
     }
 
@@ -824,17 +835,31 @@ impl App {
     }
 
     fn restore_window(&self, w: session::WindowEntry) {
+        let width = w.w.max(640);
+        let height = w.h.max(480);
+        // A session can outlive the screen it was saved on: a monitor gets
+        // unplugged, or the entry is junk (`GetWindowRect` of a *minimized*
+        // window is the -32000 sentinel). Only restore onto a monitor that
+        // still exists; otherwise keep the default centred position, which is
+        // always visible.
+        let rect = RECT {
+            left: w.x,
+            top: w.y,
+            right: w.x + width,
+            bottom: w.y + height,
+        };
+        let on_screen = !unsafe { MonitorFromRect(&rect, MONITOR_DEFAULTTONULL) }.0.is_null();
         unsafe {
             if w.maximized {
                 let _ = ShowWindow(self.hwnd, SW_MAXIMIZE);
-            } else {
+            } else if on_screen {
                 let _ = SetWindowPos(
                     self.hwnd,
                     None,
                     w.x,
                     w.y,
-                    w.w.max(640),
-                    w.h.max(480),
+                    width,
+                    height,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
@@ -852,7 +877,18 @@ impl App {
     // Single-row chrome metrics (96-dpi design units, scaled on use).
     /// Total height of the chrome row (which also hosts the top resize band).
     pub fn ui_row_h(&self) -> i32 {
-        self.s(if self.cfg.compact_mode { 36 } else { 44 })
+        // Tall enough that a centred control still lands *below* the invisible
+        // resize band: row = control + 2 × band (rounded up to an even
+        // leftover) means pill, buttons and tabs come out with exactly equal
+        // padding above and below — whatever system frame metrics apply, not
+        // only the 8px band the 46px design constant was tuned for.
+        let design = self.s(if self.cfg.compact_mode { 40 } else { 46 });
+        let control = self.ui_addr_h().max(self.ui_btn());
+        let mut row = design.max(control + 2 * w32::frame_band());
+        if (row - control) % 2 != 0 {
+            row += 1;
+        }
+        row
     }
     pub fn ui_btn(&self) -> i32 {
         self.s(if self.cfg.compact_mode { 24 } else { 28 })
@@ -874,9 +910,11 @@ impl App {
     }
 
     /// Vertical position of an `h`-tall control: centred in the row, but never
-    /// inside the invisible resize band along the top edge.
+    /// inside the invisible resize band along the top edge. With `ui_row_h`
+    /// sized as `h + 2 × band` the centred position *is* the band edge, so the
+    /// padding comes out equal top and bottom.
     fn row_y(&self, row_h: i32, h: i32) -> i32 {
-        ((row_h - h) / 2).max(w32::frame_band() + self.s(2))
+        ((row_h - h) / 2).max(w32::frame_band())
     }
 
     /// The page area: inside the frame band, below the chrome row.
@@ -957,6 +995,7 @@ impl App {
         let (ui_pt, icon_pt) = if self.cfg.compact_mode { (8, 9) } else { (9, 10) };
         self.font = w32::create_font(self.dpi, "Segoe UI", ui_pt, 400);
         self.font_icon = w32::create_font(self.dpi, "Segoe UI Symbol", icon_pt, 400);
+        self.font_line_h = w32::font_line_height(self.font);
     }
 
     fn apply_fonts(&self) {
@@ -2350,6 +2389,27 @@ impl App {
     }
 
     fn window_entry(&self) -> Option<session::WindowEntry> {
+        // `GetWindowRect` of a minimized window is the -32000 sentinel, and
+        // restoring that puts the window offscreen where nothing can reach
+        // it — exactly the "it runs but I see nothing" failure. The
+        // placement's *normal* rect is where the window will come back, so
+        // that is what a session remembers.
+        if unsafe { IsIconic(self.hwnd) }.as_bool() {
+            let mut placement = WINDOWPLACEMENT {
+                length: core::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetWindowPlacement(self.hwnd, &mut placement) }.is_ok() {
+                let r = placement.rcNormalPosition;
+                return Some(session::WindowEntry {
+                    x: r.left,
+                    y: r.top,
+                    w: r.right - r.left,
+                    h: r.bottom - r.top,
+                    maximized: false,
+                });
+            }
+        }
         let mut r = RECT::default();
         unsafe {
             GetWindowRect(self.hwnd, &mut r).ok()?;
@@ -2447,11 +2507,21 @@ impl App {
         let room = (tabs_end - left - self.s(16)).max(self.s(80));
         let pill_w = want.min(room).max(self.s(80));
         let pill = R::new(left, cy(addr_h), pill_w, addr_h);
+        // A single-line EDIT paints its line flush to the top of its client
+        // area, so the box is centred on the *line* (`tmHeight`) rather than
+        // inset by a fixed 3px: that is what puts the text in the middle of
+        // the pill, with equal padding above and below. The box always stays
+        // at least 2px inside the pill.
+        let line_h = if self.font_line_h > 0 {
+            self.font_line_h
+        } else {
+            self.s(14)
+        };
         let addr = R::new(
             pill.x + self.s(30),
-            pill.y + self.s(3),
+            pill.y + (addr_h - line_h) / 2,
             (pill.w - self.s(42)).max(self.s(40)),
-            pill.h - self.s(6),
+            ((addr_h + line_h) / 2 - self.s(2)).max(line_h + self.s(2)),
         );
         let tabs_x = pill.right() + self.s(10);
         let tabs_w = (tabs_end - tabs_x).max(0);
@@ -2550,18 +2620,47 @@ impl App {
     }
 
     /// The chrome receives mouse input only for its own controls; a press on
-    /// empty toolbar space starts a window drag once the cursor moves.
+    /// empty toolbar space starts a window drag once the cursor moves, and a
+    /// press on a tab starts a tab reorder once the cursor moves.
     pub fn chrome_down(&mut self, x: i32, y: i32) {
         let lay = self.current_layout();
-        if self.hit_at(&lay, x, y) == Hit::None {
-            self.drag = Some((x, y));
-            unsafe {
-                SetCapture(self.controls.chrome);
+        match self.hit_at(&lay, x, y) {
+            Hit::Tab(i) => {
+                self.tab_press = Some((i, x, y));
+                unsafe {
+                    SetCapture(self.controls.chrome);
+                }
             }
+            Hit::None => {
+                self.drag = Some((x, y));
+                unsafe {
+                    SetCapture(self.controls.chrome);
+                }
+            }
+            _ => {}
         }
     }
 
     pub fn chrome_hover(&mut self, x: i32, y: i32) {
+        // A pressed tab turns into a reorder once the cursor moves far
+        // enough; from then on the pill previews the slot it would land in.
+        if let Some((from, ox, oy)) = self.tab_press {
+            if self.tab_drag.is_none()
+                && ((x - ox).abs() > w32::drag_threshold()
+                    || (y - oy).abs() > w32::drag_threshold())
+            {
+                self.tab_drag = Some((from, from));
+            }
+            if let Some((from, _)) = self.tab_drag {
+                let lay = self.current_layout();
+                let slot = self.tab_drop_slot(&lay, x, from);
+                if self.tab_drag != Some((from, slot)) {
+                    self.tab_drag = Some((from, slot));
+                    self.invalidate_chrome();
+                }
+                return;
+            }
+        }
         if let Some((ox, oy)) = self.drag {
             if (x - ox).abs() > w32::drag_threshold() || (y - oy).abs() > w32::drag_threshold()
             {
@@ -2594,6 +2693,19 @@ impl App {
     }
 
     pub fn chrome_up(&mut self, x: i32, y: i32) {
+        // Finish (or cancel) a tab press/drag before anything else.
+        if let Some((pressed, _, _)) = self.tab_press.take() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            if let Some((from, slot)) = self.tab_drag.take() {
+                self.move_tab(from, slot);
+                return;
+            }
+            // Not enough movement to count as a drag: it was a click.
+            self.set_active(pressed);
+            return;
+        }
         if self.drag.take().is_some() {
             unsafe {
                 let _ = ReleaseCapture();
@@ -2634,6 +2746,8 @@ impl App {
 
     pub fn chrome_dbl(&mut self, x: i32, y: i32) {
         self.drag = None;
+        self.tab_press = None;
+        self.tab_drag = None;
         unsafe {
             let _ = ReleaseCapture();
         }
@@ -2648,6 +2762,52 @@ impl App {
         if let Hit::Tab(i) | Hit::Close(i) = self.hit_at(&lay, x, y) {
             self.close_tab(i);
         }
+    }
+
+    /// Post-removal index the dragged tab would land at for cursor `x`: the
+    /// number of *other* pills whose centre lies left of the cursor.
+    fn tab_drop_slot(&self, lay: &ChromeLayout, x: i32, from: usize) -> usize {
+        let mut slot = 0;
+        for (i, r) in self.tab_rects(lay).iter().enumerate() {
+            if i != from && x > r.x + r.w / 2 {
+                slot += 1;
+            }
+        }
+        slot
+    }
+
+    /// Tab indices in painted order — during a drag the dragged pill is
+    /// shown in the slot it would drop into, which is the whole feedback.
+    pub fn tab_display_order(&self) -> Vec<usize> {
+        let n = self.tabs.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        if let Some((from, slot)) = self.tab_drag {
+            if from < n {
+                order.remove(from);
+                order.insert(slot.min(order.len()), from);
+            }
+        }
+        order
+    }
+
+    /// Move tab `from` to index `to`, keeping the active tab pointing at the
+    /// same tab and its web view; the order is saved with the session.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() || from == to {
+            self.invalidate_chrome();
+            return;
+        }
+        let active_id = self.tabs.get(self.active).map(|t| t.id);
+        let tab = self.tabs.remove(from);
+        let to = to.min(self.tabs.len());
+        self.tabs.insert(to, tab);
+        if let Some(id) = active_id {
+            self.active = self.tabs.iter().position(|t| t.id == id).unwrap_or(0);
+        }
+        self.hover = Hit::None;
+        self.sync_chrome();
+        self.invalidate_chrome();
+        self.save_session_if_dirty();
     }
 
     fn toggle_maximize(&self) {
@@ -3170,12 +3330,17 @@ impl App {
                     }
                 }
 
-                // Tab pills.
+                // Tab pills — painted in drag display order, so the dragged
+                // pill previews the slot it would drop into.
                 let band_end = lay.tabs_x + lay.tabs_w;
-                for (i, mut r) in self.tab_rects(&lay).into_iter().enumerate() {
+                let display = self.tab_display_order();
+                for (slot, mut r) in self.tab_rects(&lay).into_iter().enumerate() {
                     if r.x >= band_end {
                         break;
                     }
+                    let Some(i) = display.get(slot).copied() else {
+                        break;
+                    };
                     if r.right() > band_end {
                         r.w = band_end - r.x;
                     }
@@ -3692,6 +3857,32 @@ unsafe extern "system" fn address_proc(
             return r;
         }
     }
+    // Clicking into the bar highlights everything — click, type, Enter is
+    // the workflow. Handled on button-*up* so a drag-select or double-click
+    // keeps the selection the control itself just made.
+    if msg == WM_LBUTTONUP {
+        let orig = ADDRESS_ORIG.with(|c| c.get());
+        if orig != 0 {
+            let proc: WNDPROC = unsafe { core::mem::transmute(orig) };
+            let r = unsafe { CallWindowProcW(proc, hwnd, msg, wparam, lparam) };
+            let mut start = 0u32;
+            let mut end = 0u32;
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    EM_GETSEL,
+                    Some(WPARAM(&mut start as *mut u32 as usize)),
+                    Some(LPARAM(&mut end as *mut u32 as isize)),
+                );
+            }
+            if start == end {
+                unsafe {
+                    SendMessageW(hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+                }
+            }
+            return r;
+        }
+    }
     if msg == WM_KEYDOWN {
         let app = unsafe { w32::user_data(hwnd) };
         if !app.is_null() {
@@ -3775,7 +3966,9 @@ unsafe fn paint_address_cue(hwnd: HWND) {
                 h,
                 app.palette().muted,
                 font,
-                DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+                // Top-aligned like the EDIT's own text, so the cue and the
+                // first typed character sit on the very same line.
+                DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
         }
         let _ = ReleaseDC(Some(hwnd), hdc);
@@ -4146,6 +4339,89 @@ mod tests {
         }
         assert!(rects[0].x >= lay.tabs_x);
         assert!(rects.iter().all(|r| r.h == a.ui_tab_h()));
+    }
+
+    #[test]
+    fn the_row_gives_every_control_equal_padding() {
+        // The complaint that started this: text and icons visibly sat lower
+        // than they should. Lock the invariant for both toolbar densities.
+        let mut a = app();
+        for compact in [false, true] {
+            a.cfg.compact_mode = compact;
+            let row = a.ui_row_h();
+            let band = w32::frame_band();
+            let lay = a.chrome_layout(1200, row);
+            for (name, r) in [
+                ("pill", lay.pill),
+                ("back", lay.back),
+                ("forward", lay.forward),
+                ("reload", lay.reload),
+                ("kebab", lay.kebab),
+                ("plus", lay.plus),
+            ] {
+                assert_eq!(r.y, row - r.bottom(), "{name} compact={compact}");
+                assert!(r.y >= band, "{name} must clear the resize band");
+            }
+            // Tabs ride the pill's line exactly.
+            a.tabs = (0..3).map(|i| tab(i + 1, "Title")).collect();
+            let lay = a.chrome_layout(1200, row);
+            for r in a.tab_rects(&lay) {
+                assert_eq!((r.y, r.h), (lay.pill.y, lay.pill.h), "compact={compact}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_drop_slot_follows_the_cursor_between_pill_centres() {
+        let mut a = app();
+        a.tabs = (1..=3).map(|i| tab(i, "Title")).collect();
+        let row = a.ui_row_h();
+        let lay = a.chrome_layout(1200, row);
+        let r = a.tab_rects(&lay);
+
+        // Left of everything lands before the first pill, right of everything
+        // lands last — whichever tab is being dragged.
+        assert_eq!(a.tab_drop_slot(&lay, r[0].x, 0), 0);
+        assert_eq!(a.tab_drop_slot(&lay, r[2].right(), 0), 2);
+        assert_eq!(a.tab_drop_slot(&lay, r[0].x, 2), 0);
+        assert_eq!(a.tab_drop_slot(&lay, r[2].right(), 2), 2);
+        // The slot flips exactly when the cursor passes a pill's centre.
+        assert_eq!(a.tab_drop_slot(&lay, r[1].x + r[1].w / 2, 0), 0);
+        assert_eq!(a.tab_drop_slot(&lay, r[1].x + r[1].w / 2 + 1, 0), 1);
+    }
+
+    #[test]
+    fn the_drag_preview_is_exactly_where_the_tab_lands() {
+        let mut a = app();
+        a.tabs = (1..=4).map(|i| tab(i, "Title")).collect();
+        a.no_session = true; // never write the real session from a test
+        a.active = 2;
+        let active_id = a.tabs[a.active].id;
+        let row = a.ui_row_h();
+        let _lay = a.chrome_layout(1200, row);
+
+        for from in 0..4usize {
+            for to in 0..4usize {
+                let before: Vec<u64> = a.tabs.iter().map(|t| t.id).collect();
+                a.tab_drag = Some((from, to));
+                let preview = a.tab_display_order();
+                a.tab_drag = None;
+                a.move_tab(from, to);
+
+                // Every slot must show exactly the tab the drag preview drew
+                // there, and the active tab must have travelled with itself.
+                for (slot, &shown) in preview.iter().enumerate() {
+                    assert_eq!(
+                        a.tabs[slot].id, before[shown],
+                        "from={from} to={to}: slot {slot} of {preview:?}"
+                    );
+                }
+                assert_eq!(
+                    a.tabs[a.active].id, active_id,
+                    "from={from} to={to}: active tab must not change identity"
+                );
+            }
+        }
     }
 
     #[test]

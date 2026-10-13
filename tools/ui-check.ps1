@@ -330,7 +330,7 @@ Write-Output ("dpi={0} client={1}x{2} compact={3}" -f $dpi, $c[2], $c[3], $compa
 
 $capW = if ($compact) { Scale 40 $dpi } else { Scale 46 $dpi }
 $kebW = if ($compact) { Scale 30 $dpi } else { Scale 34 $dpi }
-$rowH = if ($compact) { Scale 36 $dpi } else { Scale 44 $dpi }
+$rowH = if ($compact) { Scale 40 $dpi } else { Scale 46 $dpi }
 $gap = Scale 4 $dpi
 $dlW = $kebW
 
