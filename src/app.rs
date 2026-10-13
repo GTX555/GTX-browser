@@ -6,6 +6,7 @@
 //! keeps re-entrancy out of the picture.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -69,6 +70,9 @@ const BTN_GAP: i32 = 4;
 
 const TAB_MAX_W: i32 = 180;
 const TAB_MIN_W: i32 = 44;
+/// Space between neighbouring tabs — and between the omnibox and the first
+/// tab, so the whole strip reads as one rhythm (see [`App::tab_rects`]).
+const TAB_GAP: i32 = 4;
 const CLOSE_W: i32 = 20;
 /// Corner radius of the omnibox pill and the tab pills.
 const RADIUS: i32 = 7;
@@ -107,6 +111,9 @@ pub const IDT_SMOKE: usize = 2;
 /// Drives the omnibox loading bar: progress while a page loads, then the
 /// hold-and-fade once it is done.
 pub const IDT_LOAD: usize = 3;
+/// Drives the tab-slide and close-button hover eases (≈60 fps).
+pub const IDT_ANIM: usize = 4;
+const ANIM_TICK_MS: u32 = 16;
 
 // Loading-bar timings (seconds unless the name says otherwise): how fast the
 // bar eases towards its ceiling, how long a finished page keeps the full bar,
@@ -127,6 +134,17 @@ const BROWSER_ARGS_NO_GPU: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmar
 /// Clamp a f64 to a COLORREF component.
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | (g as u32) << 8 | (b as u32) << 16)
+}
+
+/// Linear blend of two colours: `t = 0` yields `a`, `t = 1` yields `b`.
+fn mix(a: COLORREF, b: COLORREF, t: f32) -> COLORREF {
+    let t = t.clamp(0.0, 1.0);
+    let ch = |shift: u32| {
+        let x = ((a.0 >> shift) & 0xff) as f32;
+        let y = ((b.0 >> shift) & 0xff) as f32;
+        (x + (y - x) * t).round() as u32
+    };
+    COLORREF(ch(0) | (ch(8) << 8) | (ch(16) << 16))
 }
 
 /// Everything the chrome paints, resolved from `theme` + `accent`.
@@ -688,6 +706,20 @@ pub struct App {
     pub tab_press: Option<(usize, i32, i32)>,
     /// Live tab drag: (from, insert-before slot in the current visual order).
     pub tab_drag: Option<(usize, usize)>,
+    /// Animated x-positions per tab id, set while a drag slide eases the
+    /// pills into their new slots; empty when idle (paint uses the layout).
+    tab_slide: HashMap<u64, f32>,
+    /// True while [`Self::anim_step`] still has a slide to finish.
+    anim_active: bool,
+    /// Tab whose close button is fading its hover plate in (or out), and
+    /// the fade progress 0..=1.
+    close_hover: Option<usize>,
+    close_fade: f32,
+    /// Last known history powers of the active tab's view. wry exposes no
+    /// history-changed event, so [`Self::refresh_nav_state`] re-queries on
+    /// navigation/tab switches and while the cursor aims at a nav button.
+    pub can_back: bool,
+    pub can_fwd: bool,
     /// `tmHeight` of `font`: the address EDIT draws its text flush to its
     /// top, so the box is centred on this line height to centre the text.
     pub font_line_h: i32,
@@ -751,12 +783,15 @@ impl App {
             suggest_sel: 0,
             popup_hover: None,
             icons: favicon::Cache::load(),
-            toolbar_icons: RefCell::new(toolbar_icons::Set::new(
-                toolbar_palette.muted,
-                toolbar_palette.text,
-            )),
+            toolbar_icons: RefCell::new(toolbar_icons::Set::new(toolbar_palette.muted)),
             tab_press: None,
             tab_drag: None,
+            tab_slide: HashMap::new(),
+            anim_active: false,
+            close_hover: None,
+            close_fade: 0.0,
+            can_back: false,
+            can_fwd: false,
             font_line_h: 0,
         }
     }
@@ -1164,6 +1199,7 @@ impl App {
         toast::hide(self.controls.toast);
         self.hide_popup();
         self.sync_chrome();
+        self.refresh_nav_state();
         self.invalidate_chrome();
         // A tab queued by `new_tab` is live now: give the user the address
         // bar with its text selected, so they can just start typing.
@@ -1311,13 +1347,43 @@ impl App {
         self.sync_address();
     }
 
+    /// Ask the active tab's view what its history allows. Internal pages
+    /// (settings / new tab / history) are regenerated from HTML rather than
+    /// history, so they never offer a move — and a tab without a view has
+    /// no history either. The verdict is cached for the paint.
+    fn refresh_nav_state(&mut self) {
+        let (back, fwd) = match self.tabs.get(self.active) {
+            Some(t) if t.kind == TabKind::Normal => match &t.view {
+                Some(v) => (
+                    v.can_go_back().unwrap_or(false),
+                    v.can_go_forward().unwrap_or(false),
+                ),
+                None => (false, false),
+            },
+            _ => (false, false),
+        };
+        if back != self.can_back || fwd != self.can_fwd {
+            self.can_back = back;
+            self.can_fwd = fwd;
+            self.invalidate_chrome();
+        }
+    }
+
     pub fn go_back(&mut self) {
+        // A disabled back button is a no-op, not an error: never touch the
+        // view (which would lazily create one for an empty tab).
+        if !self.can_back {
+            return;
+        }
         self.with_view(|v| {
             let _ = v.go_back();
         });
     }
 
     pub fn go_forward(&mut self) {
+        if !self.can_fwd {
+            return;
+        }
         self.with_view(|v| {
             let _ = v.go_forward();
         });
@@ -1871,7 +1937,12 @@ impl App {
         let internal = internal::is_internal(&url);
         if internal {
             if self.tabs[i].kind.is_internal() {
-                return; // keep showing gtx://… / about:blank
+                // Keep showing gtx://… / about:blank — and keep the (dead)
+                // nav buttons dead for it.
+                if i == self.active {
+                    self.refresh_nav_state();
+                }
+                return;
             }
         } else {
             if self.tabs[i].kind.is_internal() {
@@ -1890,6 +1961,7 @@ impl App {
         self.tabs[i].url = url;
         if i == self.active {
             self.sync_address();
+            self.refresh_nav_state();
         }
     }
 
@@ -2081,13 +2153,13 @@ impl App {
         if plan.retheme {
             self.system_dark = w32::apps_dark();
             let p = self.palette();
-            self.toolbar_icons.get_mut().set_colors(p.muted, p.text);
+            self.toolbar_icons.get_mut().set_colors(p.muted);
             self.apply_theme();
             self.apply_frame();
         }
         if plan.relayout {
             let p = self.palette();
-            self.toolbar_icons.get_mut().set_colors(p.muted, p.text);
+            self.toolbar_icons.get_mut().set_colors(p.muted);
             self.recreate_fonts();
             self.apply_fonts();
             self.layout();
@@ -2206,6 +2278,14 @@ impl App {
             IDT_SMOKE => {
                 self.report_smoke();
                 self.on_close();
+            }
+            IDT_ANIM => {
+                let lay = self.current_layout();
+                let moving = self.anim_step(&lay);
+                self.invalidate_chrome();
+                if !moving {
+                    let _ = unsafe { KillTimer(Some(self.hwnd), IDT_ANIM) };
+                }
             }
             _ => {}
         }
@@ -2523,7 +2603,7 @@ impl App {
             (pill.w - self.s(42)).max(self.s(40)),
             ((addr_h + line_h) / 2 - self.s(2)).max(line_h + self.s(2)),
         );
-        let tabs_x = pill.right() + self.s(10);
+        let tabs_x = pill.right() + self.s(TAB_GAP);
         let tabs_w = (tabs_end - tabs_x).max(0);
 
         ChromeLayout {
@@ -2552,7 +2632,7 @@ impl App {
         if n == 0 || lay.tabs_w <= 0 {
             return Vec::new();
         }
-        let gap = self.s(4);
+        let gap = self.s(TAB_GAP);
         let each = (lay.tabs_w - gap * (n as i32 - 1)) / n as i32;
         if each <= 0 {
             return Vec::new();
@@ -2655,7 +2735,12 @@ impl App {
                 let lay = self.current_layout();
                 let slot = self.tab_drop_slot(&lay, x, from);
                 if self.tab_drag != Some((from, slot)) {
+                    // Remember where every pill sits right now, then ease
+                    // them to their new slots instead of teleporting.
+                    self.seed_slide(&lay);
                     self.tab_drag = Some((from, slot));
+                    self.anim_active = true;
+                    self.start_anim();
                     self.invalidate_chrome();
                 }
                 return;
@@ -2680,15 +2765,103 @@ impl App {
         let lay = self.current_layout();
         let hit = self.hit_at(&lay, x, y);
         if hit != self.hover {
+            // SPA pushState changes emit no wry event: re-query while the
+            // user is aiming at a nav button so its verdict is current.
+            if matches!(hit, Hit::Back | Hit::Forward) {
+                self.refresh_nav_state();
+            }
+            if let Hit::Close(i) = hit {
+                self.close_hover = Some(i);
+            }
+            let fades = matches!(hit, Hit::Close(_)) || matches!(self.hover, Hit::Close(_));
             self.hover = hit;
+            if fades {
+                self.start_anim();
+            }
             self.invalidate_chrome();
         }
     }
 
     pub fn chrome_leave(&mut self) {
         if self.hover != Hit::None {
+            let fades = matches!(self.hover, Hit::Close(_));
             self.hover = Hit::None;
+            if fades {
+                self.start_anim();
+            }
             self.invalidate_chrome();
+        }
+    }
+
+    /// Snapshot every pill's current x so [`Self::anim_step`] can ease them
+    /// after the display order changes. A running slide keeps its live
+    /// positions (they are closer to where the pills already are).
+    fn seed_slide(&mut self, lay: &ChromeLayout) {
+        if self.anim_active {
+            return;
+        }
+        let rects = self.tab_rects(lay);
+        self.tab_slide.clear();
+        for (slot, i) in self.tab_display_order().into_iter().enumerate() {
+            if let (Some(r), Some(t)) = (rects.get(slot), self.tabs.get(i)) {
+                self.tab_slide.insert(t.id, r.x as f32);
+            }
+        }
+    }
+
+    /// One animation frame (≈16 ms): ease the tab pills towards their slots
+    /// and the close button's hover plate towards its target. Returns true
+    /// while anything still moves — false means the timer may stop.
+    fn anim_step(&mut self, lay: &ChromeLayout) -> bool {
+        let mut moving = false;
+        if self.anim_active {
+            let rects = self.tab_rects(lay);
+            let mut settled = true;
+            for (slot, i) in self.tab_display_order().into_iter().enumerate() {
+                let (Some(r), Some(t)) = (rects.get(slot), self.tabs.get(i)) else {
+                    continue;
+                };
+                let target = r.x as f32;
+                if let Some(cur) = self.tab_slide.get_mut(&t.id) {
+                    let d = target - *cur;
+                    if d.abs() <= 0.5 {
+                        *cur = target;
+                    } else {
+                        *cur += d * 0.4;
+                        settled = false;
+                    }
+                }
+            }
+            if settled {
+                self.anim_active = false;
+                self.tab_slide.clear();
+            } else {
+                moving = true;
+            }
+        }
+        // Close-button hover plate: up while the × is hovered, back down
+        // once the cursor moves on.
+        let target = if matches!(self.hover, Hit::Close(_)) { 1.0 } else { 0.0 };
+        let d = target - self.close_fade;
+        if d.abs() <= 0.02 {
+            self.close_fade = target;
+            if target == 0.0 {
+                self.close_hover = None;
+            }
+        } else {
+            self.close_fade += d * 0.35;
+            moving = true;
+        }
+        moving
+    }
+
+    /// (Re)start the shared animation timer; harmless if it is already set.
+    fn start_anim(&mut self) {
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), IDT_ANIM, ANIM_TICK_MS, None);
         }
     }
 
@@ -2700,6 +2873,11 @@ impl App {
             }
             if let Some((from, slot)) = self.tab_drag.take() {
                 self.move_tab(from, slot);
+                // A slide still in flight keeps easing: the pills must not
+                // freeze mid-way through the reorder.
+                if self.anim_active {
+                    self.start_anim();
+                }
                 return;
             }
             // Not enough movement to count as a drag: it was a click.
@@ -2750,6 +2928,13 @@ impl App {
         self.tab_drag = None;
         unsafe {
             let _ = ReleaseCapture();
+        }
+        // A cancelled drag snaps the layout back: let a running slide ease
+        // to it; with no slide running the pills are already at their targets.
+        if self.anim_active {
+            self.start_anim();
+        } else {
+            self.tab_slide.clear();
         }
         let lay = self.current_layout();
         if self.hit_at(&lay, x, y) == Hit::None {
@@ -3270,22 +3455,31 @@ impl App {
                 let p = self.palette();
                 let lay = self.chrome_layout(w, h);
                 let mut toolbar_icons = self.toolbar_icons.borrow_mut();
-                toolbar_icons.set_colors(p.muted, p.text);
+                toolbar_icons.set_colors(p.muted);
 
                 fill(mem, 0, 0, w, h, p.bar);
 
                 // Navigation buttons use the supplied Material SVG silhouettes.
+                // Back/forward dim to a disabled tint while the active tab's
+                // history has nowhere to go — and skip their hover plate.
                 let nav_size = self.s(20);
-                for (r, hit, icon) in [
-                    (lay.back, Hit::Back, toolbar_icons::Icon::Back),
-                    (lay.forward, Hit::Forward, toolbar_icons::Icon::Forward),
-                    (lay.reload, Hit::Reload, toolbar_icons::Icon::Reload),
-                    (lay.home, Hit::Home, toolbar_icons::Icon::Home),
+                let nav_dead = mix(p.muted, p.bar, 0.55);
+                for (r, hit, icon, enabled) in [
+                    (lay.back, Hit::Back, toolbar_icons::Icon::Back, self.can_back),
+                    (
+                        lay.forward,
+                        Hit::Forward,
+                        toolbar_icons::Icon::Forward,
+                        self.can_fwd,
+                    ),
+                    (lay.reload, Hit::Reload, toolbar_icons::Icon::Reload, true),
+                    (lay.home, Hit::Home, toolbar_icons::Icon::Home, true),
                 ] {
                     if r.w <= 0 {
                         continue;
                     }
-                    if self.hover == hit {
+                    let hot = self.hover == hit && enabled;
+                    if hot {
                         round_box(mem, r, self.s(RADIUS), p.hover, p.hover);
                     }
                     toolbar_icons.draw(
@@ -3294,7 +3488,13 @@ impl App {
                         r.x + (r.w - nav_size) / 2,
                         r.y + (r.h - nav_size) / 2,
                         nav_size,
-                        self.hover == hit,
+                        if !enabled {
+                            nav_dead
+                        } else if hot {
+                            p.text
+                        } else {
+                            p.muted
+                        },
                     );
                 }
 
@@ -3307,7 +3507,7 @@ impl App {
                     lay.pill.x + self.s(7),
                     lay.pill.y + (lay.pill.h - search_size) / 2,
                     search_size,
-                    false,
+                    p.muted,
                 );
 
                 // Loading progress along the pill's bottom edge — the band
@@ -3335,12 +3535,19 @@ impl App {
                 let band_end = lay.tabs_x + lay.tabs_w;
                 let display = self.tab_display_order();
                 for (slot, mut r) in self.tab_rects(&lay).into_iter().enumerate() {
-                    if r.x >= band_end {
-                        break;
-                    }
                     let Some(i) = display.get(slot).copied() else {
                         break;
                     };
+                    // Mid-slide a pill eases toward its slot instead of
+                    // jumping to it (targets keep their order either way).
+                    if self.anim_active {
+                        if let Some(x) = self.tabs.get(i).and_then(|t| self.tab_slide.get(&t.id)) {
+                            r.x = x.round() as i32;
+                        }
+                    }
+                    if r.x >= band_end {
+                        break;
+                    }
                     if r.right() > band_end {
                         r.w = band_end - r.x;
                     }
@@ -3414,6 +3621,25 @@ impl App {
                         );
                     }
                     if close_visible {
+                        // Hover plate behind the ×: fades in while the close
+                        // button sits under the cursor, out again on leave.
+                        let t = if self.close_hover == Some(i) {
+                            self.close_fade
+                        } else {
+                            0.0
+                        };
+                        if t > 0.01 {
+                            let cell = (r.h - self.s(6)).min(self.s(CLOSE_W - 4));
+                            let bx = r.right() - self.s(CLOSE_W) + (self.s(CLOSE_W) - cell) / 2;
+                            let by = r.y + (r.h - cell) / 2;
+                            let tone = if p.dark {
+                                rgb(0x5F, 0x60, 0x66)
+                            } else {
+                                rgb(0xD5, 0xD8, 0xDC)
+                            };
+                            let plate = mix(bg, tone, t);
+                            round_box(mem, R::new(bx, by, cell, cell), cell / 2, plate, plate);
+                        }
                         draw_text(
                             mem,
                             "\u{D7}",
@@ -3451,7 +3677,7 @@ impl App {
                     lay.plus.x + (lay.plus.w - plus_size) / 2,
                     lay.plus.y + (lay.plus.h - plus_size) / 2,
                     plus_size,
-                    self.hover == Hit::Plus,
+                    if self.hover == Hit::Plus { p.text } else { p.muted },
                 );
 
                 // The downloads button uses the supplied download SVG.
@@ -3465,7 +3691,7 @@ impl App {
                     lay.downloads.x + (lay.downloads.w - download_size) / 2,
                     lay.downloads.y + (lay.downloads.h - download_size) / 2,
                     download_size,
-                    self.hover == Hit::Downloads,
+                    if self.hover == Hit::Downloads { p.text } else { p.muted },
                 );
                 drop(toolbar_icons);
 
@@ -4277,6 +4503,118 @@ mod tests {
             last_active: Instant::now(),
             kind: TabKind::Normal,
         }
+    }
+
+    /// The address bar's right padding is the same gap the tabs leave each
+    /// other — one rhythm across the whole strip.
+    #[test]
+    fn the_address_bar_gap_equals_the_tab_gap() {
+        let mut a = app();
+        a.tabs.push(tab(1, "One"));
+        a.tabs.push(tab(2, "Two"));
+        a.active = 0;
+        let lay = a.chrome_layout(1200, 46);
+        let rects = a.tab_rects(&lay);
+        assert!(rects.len() >= 2, "two tabs lay out two pills");
+        assert_eq!(rects[0].x - lay.pill.right(), a.s(TAB_GAP));
+        assert_eq!(rects[1].x - rects[0].right(), a.s(TAB_GAP));
+    }
+
+    /// No history → the verdict is false, and clicking back must not reach
+    /// (or lazily create) a view.
+    #[test]
+    fn back_and_forward_start_dead_and_stay_dead() {
+        let mut a = app();
+        a.tabs.push(tab(1, "Example"));
+        a.active = 0;
+        a.refresh_nav_state();
+        assert!(!a.can_back && !a.can_fwd);
+        let lay = a.chrome_layout(1200, 46);
+        let r = lay.back;
+        a.chrome_down(r.x + r.w / 2, r.y + r.h / 2);
+        a.chrome_up(r.x + r.w / 2, r.y + r.h / 2);
+        assert!(
+            a.tabs[0].view.is_none(),
+            "a dead back button must not create a web view"
+        );
+        assert!(!a.can_back, "the verdict survives a click unchanged");
+    }
+
+    /// Internal pages are regenerated from HTML, never history.
+    #[test]
+    fn internal_tabs_never_report_history_moves() {
+        let mut a = app();
+        let mut t = tab(1, "Settings");
+        t.kind = TabKind::Settings;
+        t.url = settings::TAB_URL.into();
+        a.tabs.push(t);
+        a.active = 0;
+        a.refresh_nav_state();
+        assert!(!a.can_back && !a.can_fwd);
+    }
+
+    /// Dragging the first pill to the last slot eases every pill across:
+    /// the first frame moves but never teleports, and the run ends settled
+    /// with no slide state that could freeze a pill off its slot.
+    #[test]
+    fn the_tab_drag_slides_pills_into_their_new_slots() {
+        let mut a = app();
+        for i in 1..=3 {
+            a.tabs.push(tab(i, "T"));
+        }
+        a.active = 0;
+        let lay = a.chrome_layout(1200, 46);
+        let before = a.tab_rects(&lay);
+        assert_eq!(before.len(), 3);
+        let id0 = a.tabs[0].id;
+        a.seed_slide(&lay);
+        a.anim_active = true;
+        a.tab_drag = Some((0, 2)); // drag the first pill into the last slot
+        assert!(a.anim_step(&lay), "the first frame still has motion");
+        let first = a.tab_slide[&id0];
+        assert!(
+            first > before[0].x as f32 && first < before[2].x as f32,
+            "eases toward the slot (x={first}) instead of jumping"
+        );
+        for _ in 0..120 {
+            if !a.anim_step(&lay) {
+                break;
+            }
+        }
+        assert!(!a.anim_active, "the slide settles");
+        assert!(a.tab_slide.is_empty(), "no stale positions can freeze a pill");
+        assert_eq!(
+            a.tab_display_order()[2],
+            0,
+            "the preview slot is the landed slot"
+        );
+    }
+
+    /// The close plate fades in while the × is hovered and back out — and
+    /// clears itself so nothing keeps the animation timer alive.
+    #[test]
+    fn the_close_button_plate_fades_with_the_hover() {
+        let mut a = app();
+        a.tabs.push(tab(1, "One"));
+        a.tabs.push(tab(2, "Two"));
+        a.active = 0;
+        let lay = a.chrome_layout(1200, 46);
+        a.hover = Hit::Close(1);
+        a.close_hover = Some(1);
+        for _ in 0..200 {
+            if !a.anim_step(&lay) {
+                break;
+            }
+        }
+        assert_eq!(a.close_fade, 1.0);
+        a.hover = Hit::None;
+        for _ in 0..200 {
+            if !a.anim_step(&lay) {
+                break;
+            }
+        }
+        assert_eq!(a.close_fade, 0.0);
+        assert!(a.close_hover.is_none());
     }
 
     #[test]
